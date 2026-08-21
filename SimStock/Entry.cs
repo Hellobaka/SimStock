@@ -9,7 +9,7 @@ namespace SimStock;
 [PluginInfo(
     appId: "me.cqp.luohuaming.SimStock",
     name: "水银韭菜机",
-    version: "1.18.2",
+    version: "1.18.3",
     description: "群聊模拟炒股插件",
     author: "落花茗"
 )]
