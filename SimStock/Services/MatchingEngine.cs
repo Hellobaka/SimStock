@@ -12,6 +12,9 @@ public class MatchingEngine : IDisposable
     private CancellationTokenSource? _cts;
     private Task? _loopTask;
 
+    /// <summary>上次执行隔夜遗留清理的日期（每天进入交易时段时清理一次）</summary>
+    private DateTime _lastStaleClean;
+
     public MatchingEngine(ConnectionManager connMgr)
     {
         _connMgr = connMgr;
@@ -62,9 +65,22 @@ public class MatchingEngine : IDisposable
             }
 
             var isTradingDay = await _connMgr.IsTradingDayAsync();
-            var afterClose = DateTime.Now.TimeOfDay >= new TimeSpan(15, 0, 0);
-            if (isTradingDay && !afterClose)
+            if (isTradingDay && !TradingHoursChecker.IsAfterClose())
             {
+                // 当日委托当日有效：前一日遗留的挂单直接撤销，不参与结算
+                var stale = pending.Where(o => o.CreatedAt.Date < DateTime.Today).ToList();
+                if (stale.Count > 0)
+                {
+                    pending = pending.Where(o => o.CreatedAt.Date >= DateTime.Today).ToList();
+                    Entry.Api.Logger.Info("撮合引擎", $"启动时发现 {stale.Count} 个隔夜遗留挂单，自动撤销（当日委托当日有效）");
+                    await CancelOrdersWithNotifyAsync(stale, "🌙 隔夜遗留挂单已自动取消（当日委托当日有效）：");
+                }
+
+                if (pending.Count == 0)
+                {
+                    return;
+                }
+
                 Entry.Api.Logger.Info("撮合引擎", $"启动时发现 {pending.Count} 个遗留挂单，当前为交易时段，尝试结算");
                 if (await _connMgr.EnsureConnectedAsync() is null)
                 {
@@ -129,6 +145,7 @@ public class MatchingEngine : IDisposable
         // 日志去重信号：每个状态只打印一次，所有检查通过后重置
         bool loggedAuction = false;
         bool loggedOffHours = false;
+        bool loggedLunchBreak = false;
         bool loggedHoliday = false;
         bool loggedNoOrders = false;
         bool loggedConnFail = false;
@@ -136,7 +153,7 @@ public class MatchingEngine : IDisposable
 
         void ResetLogSignals()
         {
-            loggedAuction = loggedOffHours = loggedHoliday = false;
+            loggedAuction = loggedOffHours = loggedLunchBreak = loggedHoliday = false;
             loggedNoOrders = loggedConnFail = loggedQuoteFail = false;
         }
 
@@ -169,7 +186,15 @@ public class MatchingEngine : IDisposable
                     if (wasInSession)
                     {
                         wasInSession = false;
-                        await CancelAllPendingOrdersAtCloseAsync();
+                        if (TradingHoursChecker.IsAfterClose())
+                        {
+                            await CancelAllPendingOrdersAtCloseAsync();
+                        }
+                        else
+                        {
+                            // 午间休市（11:30-13:00）不是收盘：挂单保留至下午盘继续撮合
+                            LogOnce(ref loggedLunchBreak, "午间休市，挂单保留，下午盘继续撮合");
+                        }
                     }
 
                     LogOnce(ref loggedOffHours, "当前是非交易时段，不处理挂单");
@@ -181,7 +206,9 @@ public class MatchingEngine : IDisposable
                 // 检查是否交易日
                 if (!await _connMgr.IsInTradingSessionAsync())
                 {
-                    if (wasInSession)
+                    // 防御性处理：仅在 15:00 收盘后触发收盘自动撤单
+                    // （交易日不会在盘中变节假日，此分支实际几乎不会命中）
+                    if (wasInSession && TradingHoursChecker.IsAfterClose())
                     {
                         wasInSession = false;
                         await CancelAllPendingOrdersAtCloseAsync();
@@ -194,6 +221,13 @@ public class MatchingEngine : IDisposable
                 }
 
                 wasInSession = true;
+
+                // 当日委托当日有效：每天进入交易时段的第一轮清理隔夜遗留挂单
+                if (_lastStaleClean.Date != DateTime.Today)
+                {
+                    _lastStaleClean = DateTime.Now;
+                    await CancelStaleOrdersAsync();
+                }
 
                 // 获取待成交限价单
                 var pendingOrders = await TradingService.GetPendingLimitOrdersAsync();
@@ -325,19 +359,40 @@ public class MatchingEngine : IDisposable
         }
     }
 
+    /// <summary>当日委托当日有效：撤销前一日创建的挂单（防御错过收盘后的重启/停机场景）</summary>
+    private async Task CancelStaleOrdersAsync()
+    {
+        var stale = (await TradingService.GetPendingLimitOrdersAsync())
+            .Where(o => o.CreatedAt.Date < DateTime.Today)
+            .ToList();
+        if (stale.Count == 0)
+        {
+            return;
+        }
+
+        Entry.Api.Logger.Info("撮合引擎", $"清理 {stale.Count} 个隔夜遗留挂单（当日委托当日有效）");
+        await CancelOrdersWithNotifyAsync(stale, "🌙 隔夜遗留挂单已自动取消（当日委托当日有效）：");
+    }
+
     /// <summary>收盘后自动撤销所有未成交挂单，并在对应群内发送汇总通知</summary>
     private async Task CancelAllPendingOrdersAtCloseAsync()
     {
+        var pendingOrders = await TradingService.GetPendingLimitOrdersAsync();
+        if (pendingOrders.Count == 0)
+        {
+            return;
+        }
+
+        await CancelOrdersWithNotifyAsync(pendingOrders, "🌙 本日已休市，未成交挂单自动取消：");
+    }
+
+    /// <summary>撤销指定订单，并按来源（群聊/私聊）发送汇总通知</summary>
+    private async Task CancelOrdersWithNotifyAsync(List<Models.Order> orders, string heading)
+    {
         try
         {
-            var pendingOrders = await TradingService.GetPendingLimitOrdersAsync();
-            if (pendingOrders.Count == 0)
-            {
-                return;
-            }
-
             // 收集订单信息并按来源分组
-            var accountIds = pendingOrders.Select(o => o.AccountId).Distinct().ToList();
+            var accountIds = orders.Select(o => o.AccountId).Distinct().ToList();
             var accounts = await Entry.Db!.Queryable<Models.Account>()
                 .Where(a => accountIds.Contains(a.Id))
                 .ToListAsync();
@@ -347,7 +402,7 @@ public class MatchingEngine : IDisposable
             var groupOrders = new Dictionary<long, List<(Models.Order Order, long QQ)>>();
             var privateOrders = new List<(Models.Order Order, long QQ)>();
 
-            foreach (var order in pendingOrders)
+            foreach (var order in orders)
             {
                 order.Status = 3;
                 order.UpdatedAt = DateTime.Now;
@@ -375,16 +430,16 @@ public class MatchingEngine : IDisposable
             }
 
             // 群聊来源：按群发汇总
-            foreach (var (sourceGroupId, orders) in groupOrders)
+            foreach (var (sourceGroupId, groupOrderList) in groupOrders)
             {
                 try
                 {
                     var sb = new System.Text.StringBuilder();
-                    sb.AppendLine("🌙 本日已休市，未成交挂单自动取消：");
+                    sb.AppendLine(heading);
 
                     // 获取昵称后发群
                     var nameCache = new Dictionary<long, string>();
-                    foreach (var (_, qq) in orders)
+                    foreach (var (_, qq) in groupOrderList)
                     {
                         if (!nameCache.ContainsKey(qq))
                         {
@@ -401,7 +456,7 @@ public class MatchingEngine : IDisposable
                         }
                     }
 
-                    foreach (var (order, qq) in orders)
+                    foreach (var (order, qq) in groupOrderList)
                     {
                         var name = nameCache.TryGetValue(qq, out var n) ? n : qq.ToString();
                         var dir = order.OrderType switch { 1 => "买入", 3 => "卖出", _ => "?" };
@@ -427,7 +482,7 @@ public class MatchingEngine : IDisposable
                 {
                     var dir = order.OrderType switch { 1 => "买入", 3 => "卖出", _ => "?" };
                     var stockName = await Entry.StockNames.GetNameAsync(order.StockCode);
-                    var msg = $"🌙 本日已休市，挂单自动取消：\n" +
+                    var msg = $"{heading}\n" +
                               $"📋 {StockCodeParser.ToDisplayStock(stockName, order.StockCode)}\n" +
                               $"📌 {dir} {order.Quantity} 股\n" +
                               $"💲 委托价: {order.Price:F2}";
@@ -441,7 +496,7 @@ public class MatchingEngine : IDisposable
         }
         catch (Exception ex)
         {
-            Entry.Api.Logger.Warn("撮合引擎", $"收盘撤单处理异常: {ex.Message}");
+            Entry.Api.Logger.Warn("撮合引擎", $"撤单处理异常: {ex.Message}");
         }
     }
 

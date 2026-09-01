@@ -1,3 +1,4 @@
+using Another_Mirai_Native.Abstractions.Models;
 using SimStock.Models;
 using SqlSugar;
 using System.Collections.Concurrent;
@@ -633,10 +634,16 @@ public static class TradingService
             }
             else if (freshOrder.OrderType == 3) // 限价卖
             {
-                // 持仓二次校验：挂单期间持仓可能被市价卖出，防止超额卖出
+                // 持仓二次校验：挂单期间持仓可能被市价卖出，防止超额卖出。
+                // 持仓不足时直接撤单并通知玩家，避免订单悬置到收盘才消失
                 var holdingCheck = await SafetyChecker.CheckHoldingsAsync(Db, account.Id, freshOrder.StockCode, freshOrder.Quantity);
                 if (!holdingCheck.passed)
                 {
+                    freshOrder.Status = 3;
+                    freshOrder.UpdatedAt = DateTime.Now;
+                    await Db.Updateable(freshOrder).ExecuteCommandAsync();
+                    Entry.Api.Logger.Info("撮合引擎", $"限价卖单 {freshOrder.Id} {freshOrder.StockCode} 持仓不足，自动撤销");
+                    await NotifyOrderCancelledAsync(freshOrder, account, "持仓已被卖出，该挂单已自动取消");
                     return;
                 }
 
@@ -671,6 +678,44 @@ public static class TradingService
             }
         }
         finally { sem.Release(); }
+    }
+
+    /// <summary>通知订单来源（群聊/私聊）：挂单已被自动撤销</summary>
+    internal static async Task NotifyOrderCancelledAsync(Order order, Account account, string reason)
+    {
+        try
+        {
+            var stockName = await Entry.StockNames.GetNameAsync(order.StockCode);
+            var dir = order.OrderType == 1 ? "买入" : "卖出";
+            var text = "🌙 挂单已自动取消：\n" +
+                       $"📋 {StockCodeParser.ToDisplayStock(stockName, order.StockCode)}\n" +
+                       $"📌 {dir} {order.Quantity} 股\n" +
+                       $"💲 委托价: {order.Price:F2}\n" +
+                       $"⚠️ {reason}";
+
+            if (order.SourceGroupId.HasValue)
+            {
+                var mb = new MessageBuilder();
+                if (order.SourceMessageId.HasValue)
+                {
+                    mb.Items.Add(new Another_Mirai_Native.Abstractions.Models.MessageItem.Reply(order.SourceMessageId.Value));
+                }
+                else
+                {
+                    mb.At(account.QQ);
+                }
+                mb.Text(text);
+                await Entry.Api.MessageApi.SendGroupMessageAsync(order.SourceGroupId.Value, mb.Build());
+            }
+            else
+            {
+                await Entry.Api.MessageApi.SendPrivateMessageAsync(account.QQ, text);
+            }
+        }
+        catch (Exception ex)
+        {
+            Entry.Api.Logger.Warn("撮合引擎", $"挂单撤单通知发送失败: {ex.Message}");
+        }
     }
 
     /// <summary>获取所有待成交限价单</summary>

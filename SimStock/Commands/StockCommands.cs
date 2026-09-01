@@ -1057,7 +1057,7 @@ public class StockCommands : CommandHandlerBase
         await Entry.Db.Insertable(order).ExecuteCommandAsync();
 
         var execTime = TomorrowOrderEngine.FormatExecutionTime(TomorrowOrderEngine.CalculateNextExecutionTime(DateTime.Now));
-        await SendAsync(g, p, $"✅ 已预约开盘清仓：{displayStock}，将在 {execTime} 执行");
+        await SendAsync(g, p, $"✅ 已预约开盘清仓：{displayStock}，将在 {execTime} 执行\nℹ️ 若执行日逢节假日将自动顺延至下一交易日");
         return EventHandleResult.Block;
     }
 
@@ -1171,7 +1171,7 @@ public class StockCommands : CommandHandlerBase
         await Entry.Db.Insertable(order).ExecuteCommandAsync();
 
         var execTime = TomorrowOrderEngine.FormatExecutionTime(TomorrowOrderEngine.CalculateNextExecutionTime(DateTime.Now));
-        await SendAsync(g, p, $"✅ 已预约开盘梭哈：{displayStock}，将在 {execTime} 用全部可用资金买入");
+        await SendAsync(g, p, $"✅ 已预约开盘梭哈：{displayStock}，将在 {execTime} 用全部可用资金买入\nℹ️ 若执行日逢节假日将自动顺延至下一交易日");
         return EventHandleResult.Block;
     }
 
