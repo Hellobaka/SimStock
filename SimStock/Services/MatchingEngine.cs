@@ -225,8 +225,15 @@ public class MatchingEngine : IDisposable
                 // 当日委托当日有效：每天进入交易时段的第一轮清理隔夜遗留挂单
                 if (_lastStaleClean.Date != DateTime.Today)
                 {
-                    _lastStaleClean = DateTime.Now;
-                    await CancelStaleOrdersAsync();
+                    try
+                    {
+                        await CancelStaleOrdersAsync();
+                        _lastStaleClean = DateTime.Now;
+                    }
+                    catch (Exception ex)
+                    {
+                        Entry.Api.Logger.Warn("撮合引擎", $"隔夜遗留挂单清理失败，下一轮重试: {ex.Message}");
+                    }
                 }
 
                 // 获取待成交限价单
@@ -376,7 +383,24 @@ public class MatchingEngine : IDisposable
         }
 
         Entry.Api.Logger.Info("撮合引擎", $"清理 {stale.Count} 个隔夜遗留挂单（当日委托当日有效）");
-        await CancelOrdersWithNotifyAsync(stale, "🌙 隔夜遗留挂单已自动取消（当日委托当日有效）：");
+
+        // 先做 DB 更新，异常冒泡给上层重试（避免清理失败却被标记为“今日已清理”）
+        foreach (var order in stale)
+        {
+            order.Status = 3;
+            order.UpdatedAt = DateTime.Now;
+            await Entry.Db!.Updateable(order).ExecuteCommandAsync();
+        }
+
+        // 通知发送单独 try，发送失败不应阻断下一轮清理逻辑
+        try
+        {
+            await CancelOrdersWithNotifyAsync(stale, "🌙 隔夜遗留挂单已自动取消（当日委托当日有效）：");
+        }
+        catch (Exception ex)
+        {
+            Entry.Api.Logger.Warn("撮合引擎", $"隔夜撒单通知发送失败: {ex.Message}");
+        }
     }
 
     /// <summary>收盘后自动撤销所有未成交挂单，并在对应群内发送汇总通知</summary>

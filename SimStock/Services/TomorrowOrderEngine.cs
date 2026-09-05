@@ -268,7 +268,8 @@ public sealed class TomorrowOrderEngine : IDisposable
                 order.Status = 0; // 留待下一交易日继续处理
                 await Entry.Db!.Updateable(order).ExecuteCommandAsync();
                 LogInfo($"开盘清仓部分完成：{order.QQ} 全仓清仓，成功 {successCount} 只, 跳过 {skipCount} 只");
-                report.Info($"{skipCount} 只跳过（T+1/停牌/行情不可用），将在当日 13:01 自动继续，或使用 {Entry.Config.GetTrigger("TomorrowClearCancel")} 全仓 取消");
+                var nextRetryStr = FormatExecutionTime(CalculateNextExecutionTime(DateTime.Now));
+                report.Info($"{skipCount} 只跳过（T+1/停牌/行情不可用），将在 {nextRetryStr} 自动继续，或使用 {Entry.Config.GetTrigger("TomorrowClearCancel")} 全仓 取消");
                 return;
             }
 
