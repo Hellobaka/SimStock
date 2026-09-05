@@ -236,8 +236,10 @@ public class MatchingEngine : IDisposable
                     }
                 }
 
-                // 获取待成交限价单
-                var pendingOrders = await TradingService.GetPendingLimitOrdersAsync();
+                // 获取待成交限价单。上一块的隔夜清理若失败（catch 后不设标记），这里的 CreatedAt 过滤作为兄底，防止隔夜遗留挂单进入撮合被错配。
+                var pendingOrders = (await TradingService.GetPendingLimitOrdersAsync())
+                    .Where(o => o.CreatedAt.Date >= DateTime.Today)
+                    .ToList();
                 if (pendingOrders.Count == 0)
                 {
                     LogOnce(ref loggedNoOrders, "当前无待成交挂单");
