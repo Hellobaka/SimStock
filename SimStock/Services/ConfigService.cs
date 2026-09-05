@@ -13,8 +13,11 @@ public class ConfigService
 
     public decimal InitialCapital { get; set; } = 1_000_000m;
 
-    /// <summary>授信额度（固定额度，默认 10 万），用户可自定义</summary>
-    public decimal CreditAmount { get; set; } = 100000m;
+    /// <summary>授信额度（用户显式保存的值；null 表示从未设置，默认按初始资金的 100% 生效）</summary>
+    public decimal? CreditAmount { get; set; } = null;
+
+    /// <summary>生效授信额度：已显式保存则用保存值，否则默认等于初始资金</summary>
+    public decimal EffectiveCreditAmount => CreditAmount ?? InitialCapital;
 
     /// <summary>日利率（默认万分之五 0.05%）</summary>
     public decimal CreditInterestRate { get; set; } = 0.0005m;
@@ -52,6 +55,7 @@ public class ConfigService
         ["Rank"] = "/股票排行",
         ["GlobalRank"] = "/全局排行",
         ["History"] = "/历史订单",
+        ["OrderQuery"] = "/查询订单",
         ["Help"] = "/股票帮助",
         ["ClearOne"] = "/清仓",
         ["ClearAll"] = "/全部清仓",

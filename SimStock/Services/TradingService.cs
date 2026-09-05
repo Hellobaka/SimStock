@@ -1,3 +1,4 @@
+using Another_Mirai_Native.Abstractions.Models;
 using SimStock.Models;
 using SqlSugar;
 using System.Collections.Concurrent;
@@ -113,7 +114,7 @@ public static class TradingService
                 StockCode = normalizedCode,
                 OrderType = 0,
                 Quantity = quantity,
-                Price = 0,
+                Price = price,
                 FilledQuantity = quantity,
                 Status = 2,
                 CreatedAt = DateTime.Now,
@@ -140,10 +141,9 @@ public static class TradingService
                     TradedAt = DateTime.Now
                 }).ExecuteCommandAsync();
             });
+            return (order, null, fee);
         }
         finally { sem.Release(); }
-
-        return (null, null, fee);
     }
 
     // === 限价买入 ===
@@ -368,7 +368,7 @@ public static class TradingService
                 StockCode = normalizedCode,
                 OrderType = 2,
                 Quantity = quantity,
-                Price = 0,
+                Price = price,
                 FilledQuantity = quantity,
                 Status = 2,
                 CreatedAt = DateTime.Now,
@@ -395,10 +395,9 @@ public static class TradingService
                     TradedAt = DateTime.Now
                 }).ExecuteCommandAsync();
             });
+            return (order, null, fee);
         }
         finally { sem.Release(); }
-
-        return (null, null, fee);
     }
 
     // === 限价卖出 ===
@@ -575,7 +574,7 @@ public static class TradingService
     }
 
     /// <summary>撮合引擎调用：以指定价格执行限价单（含手续费）</summary>
-    public static async Task ExecuteOrderAsync(Order order, decimal executionPrice)
+    public static async Task<bool> ExecuteOrderAsync(Order order, decimal executionPrice)
     {
         var sem = GetLock(order.AccountId);
         await sem.WaitAsync();
@@ -584,13 +583,13 @@ public static class TradingService
             var freshOrder = await Db.Queryable<Order>().FirstAsync(o => o.Id == order.Id);
             if (freshOrder == null || freshOrder.Status != 0)
             {
-                return;
+                return false;
             }
 
             var account = await Db.Queryable<Account>().FirstAsync(a => a.Id == order.AccountId);
             if (account == null)
             {
-                return;
+                return false;
             }
 
             var amount = executionPrice * freshOrder.Quantity;
@@ -601,7 +600,7 @@ public static class TradingService
                 var totalCost = amount + fee;
                 if (account.Balance < totalCost)
                 {
-                    return;
+                    return false;
                 }
 
                 await Db.UseTranAsync(async () =>
@@ -630,14 +629,21 @@ public static class TradingService
                         TradedAt = DateTime.Now
                     }).ExecuteCommandAsync();
                 });
+                return true;
             }
             else if (freshOrder.OrderType == 3) // 限价卖
             {
-                // 持仓二次校验：挂单期间持仓可能被市价卖出，防止超额卖出
+                // 持仓二次校验：挂单期间持仓可能被市价卖出，防止超额卖出。
+                // 持仓不足时直接撤单并通知玩家，避免订单悬置到收盘才消失
                 var holdingCheck = await SafetyChecker.CheckHoldingsAsync(Db, account.Id, freshOrder.StockCode, freshOrder.Quantity);
                 if (!holdingCheck.passed)
                 {
-                    return;
+                    freshOrder.Status = 3;
+                    freshOrder.UpdatedAt = DateTime.Now;
+                    await Db.Updateable(freshOrder).ExecuteCommandAsync();
+                    Entry.Api.Logger.Info("撮合引擎", $"限价卖单 {freshOrder.Id} {freshOrder.StockCode} 持仓不足，自动撤销");
+                    await NotifyOrderCancelledAsync(freshOrder, account, "持仓已被卖出，该挂单已自动取消");
+                    return false;
                 }
 
                 var totalCredit = amount - fee;
@@ -668,9 +674,49 @@ public static class TradingService
                         TradedAt = DateTime.Now
                     }).ExecuteCommandAsync();
                 });
+                return true;
             }
+            return false;
         }
         finally { sem.Release(); }
+    }
+
+    /// <summary>通知订单来源（群聊/私聊）：挂单已被自动撤销</summary>
+    internal static async Task NotifyOrderCancelledAsync(Order order, Account account, string reason)
+    {
+        try
+        {
+            var stockName = await Entry.StockNames.GetNameAsync(order.StockCode);
+            var dir = order.OrderType == 1 ? "买入" : "卖出";
+            var text = "🌙 挂单已自动取消：\n" +
+                       $"📋 {StockCodeParser.ToDisplayStock(stockName, order.StockCode)}\n" +
+                       $"📌 {dir} {order.Quantity} 股\n" +
+                       $"💲 委托价: {order.Price:F2}\n" +
+                       $"⚠️ {reason}";
+
+            if (order.SourceGroupId.HasValue)
+            {
+                var mb = new MessageBuilder();
+                if (order.SourceMessageId.HasValue)
+                {
+                    mb.Items.Add(new Another_Mirai_Native.Abstractions.Models.MessageItem.Reply(order.SourceMessageId.Value));
+                }
+                else
+                {
+                    mb.At(account.QQ);
+                }
+                mb.Text(text);
+                await Entry.Api.MessageApi.SendGroupMessageAsync(order.SourceGroupId.Value, mb.Build());
+            }
+            else
+            {
+                await Entry.Api.MessageApi.SendPrivateMessageAsync(account.QQ, text);
+            }
+        }
+        catch (Exception ex)
+        {
+            Entry.Api.Logger.Warn("撮合引擎", $"挂单撤单通知发送失败: {ex.Message}");
+        }
     }
 
     /// <summary>获取所有待成交限价单</summary>

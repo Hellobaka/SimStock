@@ -30,7 +30,7 @@ public static class AccountService
             QQ = qq,
             Balance = Entry.Config.InitialCapital,
             TotalAsset = Entry.Config.InitialCapital,
-            CreditLimit = Entry.Config.CreditAmount,
+            CreditLimit = Entry.Config.EffectiveCreditAmount,
             CreatedAt = DateTime.Now,
             UpdatedAt = DateTime.Now
         };
@@ -161,7 +161,7 @@ public static class AccountService
         if (positions.Count == 0)
         {
             account.TotalAsset = account.Balance - account.DebtBalance;
-            account.CreditLimit = Entry.Config.CreditAmount;
+            account.CreditLimit = Entry.Config.EffectiveCreditAmount;
             account.UpdatedAt = DateTime.Now;
             await Db.Updateable(account).ExecuteCommandAsync();
             return;
@@ -184,8 +184,8 @@ public static class AccountService
         }
 
         account.TotalAsset = account.Balance + marketValue - account.DebtBalance;
-        // 同步更新授信额度（固定额度，不随总资产变动）
-        account.CreditLimit = Entry.Config.CreditAmount;
+        // 同步更新授信额度（生效额度：显式保存值或初始资金默认值）
+        account.CreditLimit = Entry.Config.EffectiveCreditAmount;
         account.UpdatedAt = DateTime.Now;
         await Db.Updateable(account).ExecuteCommandAsync();
     }
@@ -205,7 +205,7 @@ public static class AccountService
             // 无持仓时也同步授信额度
             foreach (var account in accounts)
             {
-                account.CreditLimit = Entry.Config.CreditAmount;
+                account.CreditLimit = Entry.Config.EffectiveCreditAmount;
                 account.UpdatedAt = DateTime.Now;
                 await Db.Updateable(account).ExecuteCommandAsync();
             }
@@ -243,8 +243,8 @@ public static class AccountService
             if (account.TotalAsset != newTotal)
             {
                 account.TotalAsset = newTotal;
-                // 同步更新授信额度（固定额度，不随总资产变动）
-                account.CreditLimit = Entry.Config.CreditAmount;
+                // 同步更新授信额度（生效额度：显式保存值或初始资金默认值）
+                account.CreditLimit = Entry.Config.EffectiveCreditAmount;
                 account.UpdatedAt = DateTime.Now;
                 await Db.Updateable(account).ExecuteCommandAsync();
             }

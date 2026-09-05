@@ -15,6 +15,15 @@ public static class TradingHoursChecker
         return morning || afternoon;
     }
 
+    /// <summary>
+    /// 收盘后（15:00:01 之后，与 IsInTradingSession 的时段结束边界一致）。
+    /// 注意与午间休市（11:30-13:00）区分：午休不是收盘，挂单应保留至下午盘。
+    /// </summary>
+    public static bool IsAfterClose()
+    {
+        return DateTime.Now.TimeOfDay >= new TimeSpan(15, 0, 1);
+    }
+
     public static bool IsInAuctionPeriod()
     {
         var t = DateTime.Now.TimeOfDay;

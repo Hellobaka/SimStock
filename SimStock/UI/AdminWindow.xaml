@@ -213,15 +213,25 @@
                             Padding="10"
                             Header="授信额度">
                             <StackPanel>
-                                <TextBlock Margin="0,8,0,4" Text="授信额度（元，默认 100000）" />
+                                <TextBlock Margin="0,8,0,4" Text="授信额度（初始资金的 %，默认 100%）" />
+                                <StackPanel Orientation="Horizontal">
+                                    <TextBox
+                                        x:Name="CreditPctInput"
+                                        Width="150"
+                                        HorizontalAlignment="Left"
+                                        TextChanged="CreditPctInput_TextChanged" />
+                                    <TextBlock Margin="8,0,0,0" VerticalAlignment="Center" Text="%" />
+                                </StackPanel>
+                                <TextBlock Margin="0,10,0,4" Text="授信额度（元）" />
                                 <TextBox
                                     x:Name="CreditAmountInput"
                                     Width="400"
-                                    HorizontalAlignment="Left" />
+                                    HorizontalAlignment="Left"
+                                    TextChanged="CreditAmountInput_TextChanged" />
                                 <TextBlock
                                     Margin="0,2,0,0"
                                     Foreground="Gray"
-                                    Text="固定授信额度，不随总资产变动。例如 100000 表示 10 万元额度" />
+                                    Text="两个输入框联动，改任意一个另一个自动同步。百分比以当前初始资金设置为基准；未手动保存前，额度默认为初始资金的 100%" />
                             </StackPanel>
                         </GroupBox>
 

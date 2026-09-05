@@ -97,4 +97,17 @@ public static class StockCodeParser
             return normalizedCode[2..];
         return normalizedCode;
     }
+
+    /// <summary>
+    /// 统一的股票显示格式: "贵州茅台（sh600519）"。
+    /// 名称查不到时（StockNameService 未命中会返回代码本身）只返回代码，避免出现 "sz000001（sz000001）"。
+    /// </summary>
+    public static string ToDisplayStock(string? name, string normalizedCode)
+    {
+        if (string.IsNullOrWhiteSpace(name) || name == normalizedCode)
+        {
+            return normalizedCode;
+        }
+        return $"{name}（{normalizedCode}）";
+    }
 }

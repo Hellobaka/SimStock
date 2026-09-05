@@ -69,6 +69,8 @@ public class StockCommands : CommandHandlerBase
 
     public string LimitSellCmd => Entry.Config.GetCommandTemplate("LimitSell");
 
+    public string OrderQueryCmd => Entry.Config.GetCommandTemplate("OrderQuery");
+
     public string PriceCmd => Entry.Config.GetCommandTemplate("Price");
 
     public string RankCmd => Entry.Config.GetCommandTemplate("Rank");
@@ -183,7 +185,7 @@ public class StockCommands : CommandHandlerBase
                 var daySign = dayChangePct >= 0 ? "+" : "";
                 var dayEmoji = dayChangePct > 0 ? "🔴" : dayChangePct < 0 ? "🟢" : "⚪";
 
-                sb.AppendLine($"📋 {stockName ?? pos.StockCode}（{StockCodeParser.ToDisplayCode(pos.StockCode)}）");
+                sb.AppendLine($"📋 {StockCodeParser.ToDisplayStock(stockName, pos.StockCode)}");
                 sb.AppendLine($"   数量: {pos.Quantity} 股");
                 sb.AppendLine($"   均价: {pos.AvgCost:F2}");
                 if (hasQuote)
@@ -309,12 +311,12 @@ public class StockCommands : CommandHandlerBase
         var quote = await Entry.Quotes!.GetQuoteAsync(market, resolvedCode);
         if (quote is null)
         {
-            await SendAsync(g, p, $" ✅ 市价买入成功！\n股票: {stockName}（{StockCodeParser.ToDisplayCode(normalized)}）\n数量: {qty} 股\n⚠️ 行情获取失败，无法显示成交价和金额\n手续费: {fee:F2} 元");
+            await SendAsync(g, p, $" ✅ 市价买入成功！\n股票: {StockCodeParser.ToDisplayStock(stockName, normalized)}\n数量: {qty} 股\n⚠️ 行情获取失败，无法显示成交价和金额\n手续费: {fee:F2} 元");
             return EventHandleResult.Block;
         }
 
         var price = (decimal)quote.Ask1;
-        await SendAsync(g, p, $" ✅ 市价买入成功！\n股票: {stockName}（{StockCodeParser.ToDisplayCode(normalized)}）\n数量: {qty} 股\n成交价: {price:F2} 元\n金额: {price * qty:N2} 元\n手续费: {fee:F2} 元");
+        await SendAsync(g, p, $" ✅ 市价买入成功！\n股票: {StockCodeParser.ToDisplayStock(stockName, normalized)}\n数量: {qty} 股\n成交价: {price:F2} 元\n金额: {price * qty:N2} 元\n手续费: {fee:F2} 元");
         return EventHandleResult.Block;
     }
 
@@ -353,7 +355,7 @@ public class StockCommands : CommandHandlerBase
         if (err3 != null) { await SendAsync(g, p, err3); return EventHandleResult.Block; }
 
         var stockName = await Entry.StockNames.GetNameAsync(normalized);
-        await SendAsync(g, p, $" 🥳 梭哈买入成功！\n股票: {stockName}（{StockCodeParser.ToDisplayCode(normalized)}）\n数量: {qty} 股\n成交价: {price:F2} 元\n金额: {price * qty:N2} 元\n手续费: {fee:F2} 元");
+        await SendAsync(g, p, $" 🥳 梭哈买入成功！\n股票: {StockCodeParser.ToDisplayStock(stockName, normalized)}\n数量: {qty} 股\n成交价: {price:F2} 元\n金额: {price * qty:N2} 元\n手续费: {fee:F2} 元");
         return EventHandleResult.Block;
     }
 
@@ -453,13 +455,117 @@ public class StockCommands : CommandHandlerBase
             var dir = t.TradeType == 0 ? "🔴买入" : "🟢卖出";
             var stockName = await Entry.StockNames.GetNameAsync(t.StockCode);
             sb.AppendLine($"⏰ {t.TradedAt:yyyy-MM-dd HH:mm}");
-            sb.AppendLine($"   {dir} {stockName}（{StockCodeParser.ToDisplayCode(t.StockCode)}）");
+            sb.AppendLine($"   {dir} {StockCodeParser.ToDisplayStock(stockName, t.StockCode)}");
             sb.AppendLine($"   数量: {t.Quantity} 股");
             sb.AppendLine($"   价格: {t.Price:F2}");
             sb.AppendLine($"   金额: {t.Amount:N2}");
             sb.AppendLine();
         }
         await SendAsync(g, p, sb.ToString(), true);
+        return EventHandleResult.Block;
+    }
+
+    // ==================== 订单查询 ====================
+    [DynamicCommand(nameof(OrderQueryCmd), MatchMode.FullMatch)]
+    public async Task<EventHandleResult> CmdOrderQuery(GroupMessageContext? g, PrivateMessageContext? p)
+    {
+        var qq = GetQQ(g, p);
+        var (groupId, _, _) = ResolveCtx(g, p);
+        if (!await CheckAccess(g, p, qq))
+        {
+            return EventHandleResult.Block;
+        }
+
+        var account = await AccountService.GetAccountAsync(qq);
+        if (account == null) { await SendAsync(g, p, $"⚠️ 请先使用 {Entry.Config.GetTrigger("Register")} 创建账户"); return EventHandleResult.Block; }
+
+        // 限价挂单中订单（1=限价买 3=限价卖），按挂出先后排序
+        var orders = await Entry.Db!.Queryable<Order>()
+            .Where(o => o.AccountId == account.Id && o.Status == 0 && (o.OrderType == 1 || o.OrderType == 3))
+            .OrderBy(o => o.Id)
+            .ToListAsync();
+
+        // 待执行的开盘预约（0=清仓 1=梭哈）
+        var reservations = await Entry.Db!.Queryable<TomorrowOrder>()
+            .Where(o => o.QQ == qq && o.Status == 0)
+            .OrderBy(o => o.Id)
+            .ToListAsync();
+
+        if (orders.Count == 0 && reservations.Count == 0)
+        {
+            await SendAsync(g, p, "📋 当前无挂单，也无开盘预约");
+            return EventHandleResult.Block;
+        }
+
+        var sb = new System.Text.StringBuilder();
+        sb.AppendLine($"📋 当前订单（挂单 {orders.Count} 笔 / 开盘预约 {reservations.Count} 笔）");
+        sb.AppendLine();
+
+        // --- 限价挂单 ---
+        if (orders.Count == 0)
+        {
+            sb.AppendLine("【限价挂单】无");
+        }
+        else
+        {
+            sb.AppendLine("【限价挂单】");
+            var names = await Entry.StockNames.GetNamesAsync(orders.Select(o => o.StockCode));
+            for (var i = 0; i < orders.Count; i++)
+            {
+                var o = orders[i];
+                var dir = o.OrderType == 1 ? "限价买入" : "限价卖出";
+                names.TryGetValue(o.StockCode, out var stockName);
+                sb.AppendLine($"{i + 1}. {dir} {StockCodeParser.ToDisplayStock(stockName, o.StockCode)}");
+                sb.AppendLine($"   限价 {o.Price:F2} | 数量 {o.Quantity} 股 | 约 {o.Price * o.Quantity:N2} 元");
+                sb.AppendLine($"   单号 #{o.Id} | {o.CreatedAt:M/d HH:mm} 挂出");
+            }
+        }
+
+        sb.AppendLine();
+
+        // --- 开盘预约 ---
+        if (reservations.Count == 0)
+        {
+            sb.AppendLine("【开盘预约】无");
+        }
+        else
+        {
+            // 所有待执行预约共享同一个执行点，只在小节标题写一次
+            var execTime = TomorrowOrderEngine.FormatExecutionTime(TomorrowOrderEngine.CalculateNextExecutionTime(DateTime.Now));
+            sb.AppendLine($"【开盘预约】执行点：{execTime}");
+            var codes = reservations.Where(r => r.StockCode != "ALL").Select(r => r.StockCode).ToList();
+            var names = codes.Count > 0 ? await Entry.StockNames.GetNamesAsync(codes) : [];
+            for (var i = 0; i < reservations.Count; i++)
+            {
+                var r = reservations[i];
+                var title = r.OrderType == 1 ? "开盘梭哈" : "开盘清仓";
+                var stockDesc = r.StockCode == "ALL"
+                    ? "全仓"
+                    : StockCodeParser.ToDisplayStock(names.TryGetValue(r.StockCode, out var n) ? n : null, r.StockCode);
+                sb.AppendLine($"{i + 1}. {title} {stockDesc}");
+                sb.AppendLine($"   {r.CreatedAt:M/d HH:mm} 预约");
+            }
+        }
+
+        // --- 提示行（按需出现） ---
+        sb.AppendLine();
+        if (orders.Count > 0)
+        {
+            sb.AppendLine($"💡 撤单：{Entry.Config.GetTrigger("Cancel")} 单号");
+        }
+        if (reservations.Count > 0)
+        {
+            var hasClear = reservations.Any(r => r.OrderType == 0);
+            var hasAllIn = reservations.Any(r => r.OrderType == 1);
+            var cancelHint = hasClear && hasAllIn
+                ? $"{Entry.Config.GetTrigger("TomorrowClearCancel")} 代码/全仓 或 {Entry.Config.GetTrigger("TomorrowAllInCancel")} 代码"
+                : hasClear
+                    ? $"{Entry.Config.GetTrigger("TomorrowClearCancel")} 代码/全仓"
+                    : $"{Entry.Config.GetTrigger("TomorrowAllInCancel")} 代码";
+            sb.AppendLine($"{(orders.Count > 0 ? "" : "💡 ")}取消预约：{cancelHint}");
+        }
+
+        await SendAsync(g, p, sb.ToString());
         return EventHandleResult.Block;
     }
 
@@ -494,11 +600,11 @@ public class StockCommands : CommandHandlerBase
 
         if (fee.HasValue)
         {
-            await SendAsync(g, p, $" 🎯 限价买入已立即成交！\n股票: {stockName}（{StockCodeParser.ToDisplayCode(normalized)}）\n数量: {qty} 股\n成交价: {currentAsk:F2} 元\n手续费: {fee:F2} 元");
+            await SendAsync(g, p, $" 🎯 限价买入已立即成交！\n股票: {StockCodeParser.ToDisplayStock(stockName, normalized)}\n数量: {qty} 股\n成交价: {currentAsk:F2} 元\n手续费: {fee:F2} 元");
         }
         else
         {
-            await SendAsync(g, p, $" 📝 限价买单已挂出！\n订单号: {pendingId ?? 0}\n股票: {stockName}（{StockCodeParser.ToDisplayCode(normalized)}）\n数量: {qty} 股\n委托价: {price:F2} 元\n当前卖一: {currentAsk:F2} 元\n⏳ 当卖一价 ≤ {price:F2} 时自动成交");
+            await SendAsync(g, p, $" 📝 限价买单已挂出！\n订单号: {pendingId ?? 0}\n股票: {StockCodeParser.ToDisplayStock(stockName, normalized)}\n数量: {qty} 股\n委托价: {price:F2} 元\n当前卖一: {currentAsk:F2} 元\n⏳ 当卖一价 ≤ {price:F2} 时自动成交");
         }
 
         return EventHandleResult.Block;
@@ -538,11 +644,11 @@ public class StockCommands : CommandHandlerBase
 
         if (fee.HasValue)
         {
-            await SendAsync(g, p, $" 🥳 限价梭哈已立即成交！\n股票: {stockName}（{StockCodeParser.ToDisplayCode(normalized)}）\n数量: {qty} 股\n成交价: {currentAsk:F2} 元\n手续费: {fee:F2} 元");
+            await SendAsync(g, p, $" 🥳 限价梭哈已立即成交！\n股票: {StockCodeParser.ToDisplayStock(stockName, normalized)}\n数量: {qty} 股\n成交价: {currentAsk:F2} 元\n手续费: {fee:F2} 元");
         }
         else
         {
-            await SendAsync(g, p, $" 🤯 限价梭哈单已挂出！\n订单号: {pendingId ?? 0}\n股票: {stockName}（{StockCodeParser.ToDisplayCode(normalized)}）\n数量: {qty} 股\n委托价: {price:F2} 元\n当前卖一: {currentAsk:F2} 元\n⏳ 当卖一价 ≤ {price:F2} 时自动成交");
+            await SendAsync(g, p, $" 🤯 限价梭哈单已挂出！\n订单号: {pendingId ?? 0}\n股票: {StockCodeParser.ToDisplayStock(stockName, normalized)}\n数量: {qty} 股\n委托价: {price:F2} 元\n当前卖一: {currentAsk:F2} 元\n⏳ 当卖一价 ≤ {price:F2} 时自动成交");
         }
 
         return EventHandleResult.Block;
@@ -578,11 +684,11 @@ public class StockCommands : CommandHandlerBase
 
         if (fee.HasValue)
         {
-            await SendAsync(g, p, $" 🎯 限价卖出已立即成交！\n股票: {stockName}（{StockCodeParser.ToDisplayCode(normalized)}）\n数量: {qty} 股\n成交价: {currentBid:F2} 元\n手续费: {fee:F2} 元");
+            await SendAsync(g, p, $" 🎯 限价卖出已立即成交！\n股票: {StockCodeParser.ToDisplayStock(stockName, normalized)}\n数量: {qty} 股\n成交价: {currentBid:F2} 元\n手续费: {fee:F2} 元");
         }
         else
         {
-            await SendAsync(g, p, $" 📝 限价卖单已挂出！\n订单号: {pendingId ?? 0}\n股票: {stockName}（{StockCodeParser.ToDisplayCode(normalized)}）\n数量: {qty} 股\n委托价: {price:F2} 元\n当前买一: {currentBid:F2} 元\n⏳ 当买一价 ≥ {price:F2} 时自动成交");
+            await SendAsync(g, p, $" 📝 限价卖单已挂出！\n订单号: {pendingId ?? 0}\n股票: {StockCodeParser.ToDisplayStock(stockName, normalized)}\n数量: {qty} 股\n委托价: {price:F2} 元\n当前买一: {currentBid:F2} 元\n⏳ 当买一价 ≥ {price:F2} 时自动成交");
         }
 
         return EventHandleResult.Block;
@@ -600,10 +706,9 @@ public class StockCommands : CommandHandlerBase
         var (market, resolvedCode, normalized, resolveErr) = await Entry.Quotes!.ResolveCodeAsync(code);
         if (resolveErr != null && market == 0) { await SendAsync(g, p, resolveErr); return EventHandleResult.Block; }
 
-        var quote = await Entry.Quotes!.GetQuoteAsync(market, resolvedCode);
-        if (quote == null || quote.Price <= 0) { await SendAsync(g, p, $"⚠️ 未获取到 {StockCodeParser.ToDisplayCode(normalized)} 的行情数据，可能不在交易时段"); return EventHandleResult.Block; }
-
         var name = await Entry.StockNames.GetNameAsync(normalized);
+        var quote = await Entry.Quotes!.GetQuoteAsync(market, resolvedCode);
+        if (quote == null || quote.Price <= 0) { await SendAsync(g, p, $"⚠️ 未获取到 {StockCodeParser.ToDisplayStock(name, normalized)} 的行情数据，可能不在交易时段"); return EventHandleResult.Block; }
         var isAStock = QuoteService.IsAStock(market, resolvedCode);
         var typeTag = isAStock ? "" : $" [{TdxProtocol.TdxConstants.GetSecurityTypeName(market, resolvedCode)}]";
         var changePct = quote.LastClose > 0 ? (quote.Price - quote.LastClose) / quote.LastClose * 100 : 0;
@@ -611,7 +716,7 @@ public class StockCommands : CommandHandlerBase
         var changeEmoji = changePct > 0 ? "🔴" : changePct < 0 ? "🟢" : "⚪";
 
         var sb = new System.Text.StringBuilder();
-        sb.AppendLine($"📈 {name}（{StockCodeParser.ToDisplayCode(normalized)}）{typeTag} 实时行情");
+        sb.AppendLine($"📈 {StockCodeParser.ToDisplayStock(name, normalized)}{typeTag} 实时行情");
         sb.AppendLine($"💹 现价: {quote.Price:F2}");
         sb.AppendLine($"📅 昨收: {quote.LastClose:F2}");
         sb.AppendLine($"📊 涨跌: {changeEmoji} {changeSign}{changePct:F2}%");
@@ -714,7 +819,7 @@ public class StockCommands : CommandHandlerBase
             var pos = positions.FirstOrDefault(p => p.StockCode == normalized);
             if (pos == null || pos.Quantity <= 0)
             {
-                await SendAsync(g, p, $"⚠️ 您没有持有 {code}，无法清仓");
+                await SendAsync(g, p, $"⚠️ 您没有持有 {StockCodeParser.ToDisplayStock(stockName, normalized)}，无法清仓");
                 return EventHandleResult.Block;
             }
 
@@ -726,12 +831,12 @@ public class StockCommands : CommandHandlerBase
             var quote = await Entry.Quotes!.GetQuoteAsync(market, resolvedCode);
             if (quote is null)
             {
-                await SendAsync(g, p, $" ✅ 清仓成功！\n股票: {stockName}（{StockCodeParser.ToDisplayCode(normalized)}）\n数量: {sellQty} 股\n⚠️ 行情获取失败，无法显示成交价和金额\n手续费: {fee:F2} 元");
+                await SendAsync(g, p, $" ✅ 清仓成功！\n股票: {StockCodeParser.ToDisplayStock(stockName, normalized)}\n数量: {sellQty} 股\n⚠️ 行情获取失败，无法显示成交价和金额\n手续费: {fee:F2} 元");
                 return EventHandleResult.Block;
             }
 
             var price = (decimal)quote.Bid1;
-            await SendAsync(g, p, $" ✅ 清仓成功！\n股票: {stockName}（{StockCodeParser.ToDisplayCode(normalized)}）\n数量: {sellQty} 股\n成交价: {price:F2} 元\n金额: {price * sellQty:N2} 元\n手续费: {fee:F2} 元");
+            await SendAsync(g, p, $" ✅ 清仓成功！\n股票: {StockCodeParser.ToDisplayStock(stockName, normalized)}\n数量: {sellQty} 股\n成交价: {price:F2} 元\n金额: {price * sellQty:N2} 元\n手续费: {fee:F2} 元");
         }
         else if (int.TryParse(qty, out var parsedQty) && parsedQty > 0)
         {
@@ -742,12 +847,12 @@ public class StockCommands : CommandHandlerBase
             var quote = await Entry.Quotes!.GetQuoteAsync(market, resolvedCode);
             if (quote is null)
             {
-                await SendAsync(g, p, $" ✅ 市价卖出成功！\n股票: {stockName}（{StockCodeParser.ToDisplayCode(normalized)}）\n数量: {parsedQty} 股\n⚠️ 行情获取失败，无法显示成交价和金额\n手续费: {fee:F2} 元");
+                await SendAsync(g, p, $" ✅ 市价卖出成功！\n股票: {StockCodeParser.ToDisplayStock(stockName, normalized)}\n数量: {parsedQty} 股\n⚠️ 行情获取失败，无法显示成交价和金额\n手续费: {fee:F2} 元");
                 return EventHandleResult.Block;
             }
 
             var price = (decimal)quote.Bid1;
-            await SendAsync(g, p, $" ✅ 市价卖出成功！\n股票: {stockName}（{StockCodeParser.ToDisplayCode(normalized)}）\n数量: {parsedQty} 股\n成交价: {price:F2} 元\n金额: {price * parsedQty:N2} 元\n手续费: {fee:F2} 元");
+            await SendAsync(g, p, $" ✅ 市价卖出成功！\n股票: {StockCodeParser.ToDisplayStock(stockName, normalized)}\n数量: {parsedQty} 股\n成交价: {price:F2} 元\n金额: {price * parsedQty:N2} 元\n手续费: {fee:F2} 元");
         }
         else
         {
@@ -776,12 +881,14 @@ public class StockCommands : CommandHandlerBase
         var (market, resolvedCode, normalized, resolveErr) = await Entry.Quotes!.ResolveCodeAsync(code);
         if (resolveErr != null && market == 0) { await SendAsync(g, p, resolveErr); return EventHandleResult.Block; }
 
+        var stockName = await Entry.StockNames.GetNameAsync(normalized);
+
         // 获取持仓数量
         var positions = await AccountService.GetPositionsAsync(account.Id);
         var pos = positions.FirstOrDefault(p => p.StockCode == normalized);
         if (pos == null || pos.Quantity <= 0)
         {
-            await SendAsync(g, p, $"⚠️ 您没有持有 {code}，无法清仓");
+            await SendAsync(g, p, $"⚠️ 您没有持有 {StockCodeParser.ToDisplayStock(stockName, normalized)}，无法清仓");
             return EventHandleResult.Block;
         }
 
@@ -790,16 +897,15 @@ public class StockCommands : CommandHandlerBase
         var (order, err3, fee) = await TradingService.MarketSellAsync(qq, normalized, qty, sourceGroupId);
         if (err3 != null) { await SendAsync(g, p, err3); return EventHandleResult.Block; }
 
-        var stockName = await Entry.StockNames.GetNameAsync(normalized);
         var quote = await Entry.Quotes!.GetQuoteAsync(market, resolvedCode);
         if (quote is null)
         {
-            await SendAsync(g, p, $" ✅ 清仓成功！\n股票: {stockName}（{StockCodeParser.ToDisplayCode(normalized)}）\n数量: {qty} 股\n⚠️ 行情获取失败，无法显示成交价和金额\n手续费: {fee:F2} 元");
+            await SendAsync(g, p, $" ✅ 清仓成功！\n股票: {StockCodeParser.ToDisplayStock(stockName, normalized)}\n数量: {qty} 股\n⚠️ 行情获取失败，无法显示成交价和金额\n手续费: {fee:F2} 元");
             return EventHandleResult.Block;
         }
 
         var price = (decimal)quote.Bid1;
-        await SendAsync(g, p, $" ✅ 清仓成功！\n股票: {stockName}（{StockCodeParser.ToDisplayCode(normalized)}）\n数量: {qty} 股\n成交价: {price:F2} 元\n金额: {price * qty:N2} 元\n手续费: {fee:F2} 元");
+        await SendAsync(g, p, $" ✅ 清仓成功！\n股票: {StockCodeParser.ToDisplayStock(stockName, normalized)}\n数量: {qty} 股\n成交价: {price:F2} 元\n金额: {price * qty:N2} 元\n手续费: {fee:F2} 元");
         return EventHandleResult.Block;
     }
 
@@ -844,12 +950,13 @@ public class StockCommands : CommandHandlerBase
             }
 
             var (market, code) = parsed.Value;
+            var displayName = StockCodeParser.ToDisplayStock(await Entry.StockNames.GetNameAsync(pos.StockCode), pos.StockCode);
 
             // 检查 T+1
             var t1Check = await SafetyChecker.CheckT1RuleAsync(Entry.Db!, account.Id, pos.StockCode);
             if (!t1Check.passed)
             {
-                sb.AppendLine($"⚠️ {pos.StockCode}: {t1Check.error}");
+                sb.AppendLine($"⚠️ {displayName}: {t1Check.error}");
                 skipCount++;
                 continue;
             }
@@ -858,7 +965,7 @@ public class StockCommands : CommandHandlerBase
             var quote = await Entry.Quotes!.GetQuoteAsync(market, code);
             if (quote == null)
             {
-                sb.AppendLine($"⚠️ {pos.StockCode}: 行情获取失败");
+                sb.AppendLine($"⚠️ {displayName}: 行情获取失败");
                 skipCount++;
                 continue;
             }
@@ -867,14 +974,14 @@ public class StockCommands : CommandHandlerBase
             var suspensionCheck = SafetyChecker.CheckSuspension(quote.Bid1, quote.Ask1);
             if (!suspensionCheck.passed)
             {
-                sb.AppendLine($"⚠️ {pos.StockCode}: {suspensionCheck.error}");
+                sb.AppendLine($"⚠️ {displayName}: {suspensionCheck.error}");
                 skipCount++;
                 continue;
             }
 
             if (quote.Bid1 <= 0)
             {
-                sb.AppendLine($"⚠️ {pos.StockCode}: 无买盘，无法卖出");
+                sb.AppendLine($"⚠️ {displayName}: 无买盘，无法卖出");
                 skipCount++;
                 continue;
             }
@@ -883,14 +990,13 @@ public class StockCommands : CommandHandlerBase
             var (order, sellErr, fee) = await TradingService.MarketSellAsync(qq, pos.StockCode, pos.Quantity, sourceGroupId);
             if (sellErr != null)
             {
-                sb.AppendLine($"⚠️ {pos.StockCode}: {sellErr}");
+                sb.AppendLine($"⚠️ {displayName}: {sellErr}");
                 skipCount++;
             }
             else
             {
-                var stockName = await Entry.StockNames.GetNameAsync(pos.StockCode);
                 var sellPrice = (decimal)quote.Bid1;
-                sb.AppendLine($"✅ {stockName}（{StockCodeParser.ToDisplayCode(pos.StockCode)}） 卖出 {pos.Quantity} 股 @ {sellPrice:F2} 元");
+                sb.AppendLine($"✅ {displayName} 卖出 {pos.Quantity} 股 @ {sellPrice:F2} 元");
                 successCount++;
             }
         }
@@ -930,12 +1036,12 @@ public class StockCommands : CommandHandlerBase
         if (account == null) { await SendAsync(g, p, err2!); return EventHandleResult.Block; }
 
         string normalizedCode;
-        string displayCode;
+        string displayStock;
 
         if (code == "全仓")
         {
             normalizedCode = "ALL";
-            displayCode = "全仓";
+            displayStock = "全仓";
         }
         else
         {
@@ -943,7 +1049,7 @@ public class StockCommands : CommandHandlerBase
             var (market, resolvedCode, normalized, resolveErr) = await Entry.Quotes.ResolveCodeAsync(code);
             if (resolveErr != null && market == 0) { await SendAsync(g, p, resolveErr); return EventHandleResult.Block; }
             normalizedCode = normalized;
-            displayCode = StockCodeParser.ToDisplayCode(normalized);
+            displayStock = StockCodeParser.ToDisplayStock(await Entry.StockNames.GetNameAsync(normalized), normalized);
         }
 
         // 检查是否有持仓
@@ -961,7 +1067,7 @@ public class StockCommands : CommandHandlerBase
             var pos = positions.FirstOrDefault(x => x.StockCode == normalizedCode);
             if (pos == null || pos.Quantity <= 0)
             {
-                await SendAsync(g, p, $"⚠️ 您未持有 {displayCode}，无需清仓");
+                await SendAsync(g, p, $"⚠️ 您未持有 {displayStock}，无需清仓");
                 return EventHandleResult.Block;
             }
         }
@@ -971,7 +1077,7 @@ public class StockCommands : CommandHandlerBase
             .AnyAsync(o => o.QQ == qq && o.StockCode == normalizedCode && o.Status == 0);
         if (existing)
         {
-            await SendAsync(g, p, $"⚠️ 已存在 {displayCode} 的待执行清仓订单");
+            await SendAsync(g, p, $"⚠️ 已存在 {displayStock} 的待执行清仓订单");
             return EventHandleResult.Block;
         }
 
@@ -987,7 +1093,8 @@ public class StockCommands : CommandHandlerBase
         };
         await Entry.Db.Insertable(order).ExecuteCommandAsync();
 
-        await SendAsync(g, p, $"✅ 已预约开盘清仓：{displayCode}，将在下一个交易日开盘后执行");
+        var execTime = TomorrowOrderEngine.FormatExecutionTime(TomorrowOrderEngine.CalculateNextExecutionTime(DateTime.Now));
+        await SendAsync(g, p, $"✅ 已预约开盘清仓：{displayStock}，将在 {execTime} 执行\nℹ️ 若执行日逢节假日将自动顺延至下一交易日");
         return EventHandleResult.Block;
     }
 
@@ -1008,12 +1115,12 @@ public class StockCommands : CommandHandlerBase
         }
 
         string normalizedCode;
-        string displayCode;
+        string displayStock;
 
         if (code == "全仓")
         {
             normalizedCode = "ALL";
-            displayCode = "全仓";
+            displayStock = "全仓";
         }
         else
         {
@@ -1021,7 +1128,7 @@ public class StockCommands : CommandHandlerBase
             var (market, resolvedCode, normalized, resolveErr) = await Entry.Quotes.ResolveCodeAsync(code);
             if (resolveErr != null && market == 0) { await SendAsync(g, p, resolveErr); return EventHandleResult.Block; }
             normalizedCode = normalized;
-            displayCode = StockCodeParser.ToDisplayCode(normalized);
+            displayStock = StockCodeParser.ToDisplayStock(await Entry.StockNames.GetNameAsync(normalized), normalized);
         }
 
         var pendingOrders = await Entry.Db!.Queryable<TomorrowOrder>()
@@ -1030,7 +1137,7 @@ public class StockCommands : CommandHandlerBase
 
         if (pendingOrders.Count == 0)
         {
-            await SendAsync(g, p, $"⚠️ 未找到 {displayCode} 的待执行清仓订单");
+            await SendAsync(g, p, $"⚠️ 未找到 {displayStock} 的待执行清仓订单");
             return EventHandleResult.Block;
         }
 
@@ -1041,7 +1148,7 @@ public class StockCommands : CommandHandlerBase
             await Entry.Db.Updateable(order).ExecuteCommandAsync();
         }
 
-        await SendAsync(g, p, $"✅ 已取消 {displayCode} 的开盘清仓预约（{pendingOrders.Count} 单）");
+        await SendAsync(g, p, $"✅ 已取消 {displayStock} 的开盘清仓预约（{pendingOrders.Count} 单）");
         return EventHandleResult.Block;
     }
 
@@ -1076,14 +1183,14 @@ public class StockCommands : CommandHandlerBase
         if (Entry.Quotes == null) { await SendAsync(g, p, "⚠️ 行情服务未就绪，请稍后重试"); return EventHandleResult.Block; }
         var (market, resolvedCode, normalized, resolveErr) = await Entry.Quotes.ResolveCodeAsync(code);
         if (resolveErr != null && market == 0) { await SendAsync(g, p, resolveErr); return EventHandleResult.Block; }
-        var displayCode = StockCodeParser.ToDisplayCode(normalized);
+        var displayStock = StockCodeParser.ToDisplayStock(await Entry.StockNames.GetNameAsync(normalized), normalized);
 
         // 检查是否已有待执行的同代码开盘订单（清仓或梭哈都不能重复预约，避免开盘先卖后买自相矛盾）
         var existing = await Entry.Db!.Queryable<TomorrowOrder>()
             .AnyAsync(o => o.QQ == qq && o.StockCode == normalized && o.Status == 0);
         if (existing)
         {
-            await SendAsync(g, p, $"⚠️ 已存在 {displayCode} 的待执行开盘订单，请先取消后再预约");
+            await SendAsync(g, p, $"⚠️ 已存在 {displayStock} 的待执行开盘订单，请先取消后再预约");
             return EventHandleResult.Block;
         }
 
@@ -1100,7 +1207,8 @@ public class StockCommands : CommandHandlerBase
         };
         await Entry.Db.Insertable(order).ExecuteCommandAsync();
 
-        await SendAsync(g, p, $"✅ 已预约开盘梭哈：{displayCode}，将在下一个交易日开盘后用全部可用资金买入");
+        var execTime = TomorrowOrderEngine.FormatExecutionTime(TomorrowOrderEngine.CalculateNextExecutionTime(DateTime.Now));
+        await SendAsync(g, p, $"✅ 已预约开盘梭哈：{displayStock}，将在 {execTime} 用全部可用资金买入\nℹ️ 若执行日逢节假日将自动顺延至下一交易日");
         return EventHandleResult.Block;
     }
 
@@ -1123,7 +1231,7 @@ public class StockCommands : CommandHandlerBase
         if (Entry.Quotes == null) { await SendAsync(g, p, "⚠️ 行情服务未就绪，请稍后重试"); return EventHandleResult.Block; }
         var (market, resolvedCode, normalized, resolveErr) = await Entry.Quotes.ResolveCodeAsync(code);
         if (resolveErr != null && market == 0) { await SendAsync(g, p, resolveErr); return EventHandleResult.Block; }
-        var displayCode = StockCodeParser.ToDisplayCode(normalized);
+        var displayStock = StockCodeParser.ToDisplayStock(await Entry.StockNames.GetNameAsync(normalized), normalized);
 
         var pendingOrders = await Entry.Db!.Queryable<TomorrowOrder>()
             .Where(o => o.QQ == qq && o.StockCode == normalized && o.OrderType == 1 && o.Status == 0)
@@ -1131,7 +1239,7 @@ public class StockCommands : CommandHandlerBase
 
         if (pendingOrders.Count == 0)
         {
-            await SendAsync(g, p, $"⚠️ 未找到 {displayCode} 的待执行开盘梭哈订单");
+            await SendAsync(g, p, $"⚠️ 未找到 {displayStock} 的待执行开盘梭哈订单");
             return EventHandleResult.Block;
         }
 
@@ -1142,7 +1250,7 @@ public class StockCommands : CommandHandlerBase
             await Entry.Db.Updateable(order).ExecuteCommandAsync();
         }
 
-        await SendAsync(g, p, $"✅ 已取消 {displayCode} 的开盘梭哈预约（{pendingOrders.Count} 单）");
+        await SendAsync(g, p, $"✅ 已取消 {displayStock} 的开盘梭哈预约（{pendingOrders.Count} 单）");
         return EventHandleResult.Block;
     }
 
@@ -1163,7 +1271,7 @@ public class StockCommands : CommandHandlerBase
         // 存量账号兼容：建号早于授信功能、CreditLimit 未初始化的账号，查询时兜底同步为配置额度
         if (account.CreditLimit <= 0)
         {
-            account.CreditLimit = Entry.Config.CreditAmount;
+            account.CreditLimit = Entry.Config.EffectiveCreditAmount;
             account.UpdatedAt = DateTime.Now;
             await Entry.Db!.Updateable(account).ExecuteCommandAsync();
         }
@@ -1208,7 +1316,7 @@ public class StockCommands : CommandHandlerBase
             // 存量账号兼容：CreditLimit 未初始化的账号，借款前兑底同步为配置额度
             if (account.CreditLimit <= 0)
             {
-                account.CreditLimit = Entry.Config.CreditAmount;
+                account.CreditLimit = Entry.Config.EffectiveCreditAmount;
                 account.UpdatedAt = DateTime.Now;
                 await Entry.Db.Updateable(account).ExecuteCommandAsync();
             }
@@ -1416,9 +1524,9 @@ public class StockCommands : CommandHandlerBase
             {t("Cancel")} 订单号   撤销挂单
             {t("ClearOne")} 代码     清仓指定股票（全仓卖出）
             {t("ClearAll")}          清仓全部持仓
-            {t("TomorrowClear")} 代码/全仓  预约开盘清仓（非交易时段使用）
+            {t("TomorrowClear")} 代码/全仓  预约下一开盘（9:31/13:01）清仓
             {t("TomorrowClearCancel")} 代码/全仓  取消预约开盘清仓
-            {t("TomorrowAllIn")} 代码   预约开盘梭哈（非交易时段使用）
+            {t("TomorrowAllIn")} 代码   预约下一开盘（9:31/13:01）全仓买入
             {t("TomorrowAllInCancel")} 代码  取消预约开盘梭哈
             {t("Credit")}            查询授信额度与欠款
             {t("CreditUse")} 金额   使用授信借款（梭哈表示用满剩余额度）
@@ -1428,6 +1536,7 @@ public class StockCommands : CommandHandlerBase
             {t("Rank")}          本群交易排行榜
             {t("GlobalRank")}          全局交易排行榜
             {t("History")}          个人交易历史
+            {t("OrderQuery")}          查看挂单与开盘预约
             {t("Help")}          显示本帮助
 
             ⚠️ 【交易规则】
