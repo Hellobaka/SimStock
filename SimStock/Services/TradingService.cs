@@ -114,7 +114,7 @@ public static class TradingService
                 StockCode = normalizedCode,
                 OrderType = 0,
                 Quantity = quantity,
-                Price = 0,
+                Price = price,
                 FilledQuantity = quantity,
                 Status = 2,
                 CreatedAt = DateTime.Now,
@@ -141,10 +141,9 @@ public static class TradingService
                     TradedAt = DateTime.Now
                 }).ExecuteCommandAsync();
             });
+            return (order, null, fee);
         }
         finally { sem.Release(); }
-
-        return (null, null, fee);
     }
 
     // === 限价买入 ===
@@ -369,7 +368,7 @@ public static class TradingService
                 StockCode = normalizedCode,
                 OrderType = 2,
                 Quantity = quantity,
-                Price = 0,
+                Price = price,
                 FilledQuantity = quantity,
                 Status = 2,
                 CreatedAt = DateTime.Now,
@@ -396,10 +395,9 @@ public static class TradingService
                     TradedAt = DateTime.Now
                 }).ExecuteCommandAsync();
             });
+            return (order, null, fee);
         }
         finally { sem.Release(); }
-
-        return (null, null, fee);
     }
 
     // === 限价卖出 ===
@@ -576,7 +574,7 @@ public static class TradingService
     }
 
     /// <summary>撮合引擎调用：以指定价格执行限价单（含手续费）</summary>
-    public static async Task ExecuteOrderAsync(Order order, decimal executionPrice)
+    public static async Task<bool> ExecuteOrderAsync(Order order, decimal executionPrice)
     {
         var sem = GetLock(order.AccountId);
         await sem.WaitAsync();
@@ -585,13 +583,13 @@ public static class TradingService
             var freshOrder = await Db.Queryable<Order>().FirstAsync(o => o.Id == order.Id);
             if (freshOrder == null || freshOrder.Status != 0)
             {
-                return;
+                return false;
             }
 
             var account = await Db.Queryable<Account>().FirstAsync(a => a.Id == order.AccountId);
             if (account == null)
             {
-                return;
+                return false;
             }
 
             var amount = executionPrice * freshOrder.Quantity;
@@ -602,7 +600,7 @@ public static class TradingService
                 var totalCost = amount + fee;
                 if (account.Balance < totalCost)
                 {
-                    return;
+                    return false;
                 }
 
                 await Db.UseTranAsync(async () =>
@@ -631,6 +629,7 @@ public static class TradingService
                         TradedAt = DateTime.Now
                     }).ExecuteCommandAsync();
                 });
+                return true;
             }
             else if (freshOrder.OrderType == 3) // 限价卖
             {
@@ -644,7 +643,7 @@ public static class TradingService
                     await Db.Updateable(freshOrder).ExecuteCommandAsync();
                     Entry.Api.Logger.Info("撮合引擎", $"限价卖单 {freshOrder.Id} {freshOrder.StockCode} 持仓不足，自动撤销");
                     await NotifyOrderCancelledAsync(freshOrder, account, "持仓已被卖出，该挂单已自动取消");
-                    return;
+                    return false;
                 }
 
                 var totalCredit = amount - fee;
@@ -675,7 +674,9 @@ public static class TradingService
                         TradedAt = DateTime.Now
                     }).ExecuteCommandAsync();
                 });
+                return true;
             }
+            return false;
         }
         finally { sem.Release(); }
     }

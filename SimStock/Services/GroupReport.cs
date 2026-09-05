@@ -9,7 +9,6 @@ namespace SimStock;
 public sealed class GroupReport
 {
     private readonly List<string> _lines = new();
-    private readonly HashSet<long> _mentionedQqs = new();
 
     public long GroupId { get; }
     public int SuccessCount { get; private set; }
@@ -21,24 +20,21 @@ public sealed class GroupReport
         GroupId = groupId;
     }
 
-    /// <summary>记录需要在结算消息中 @ 的 QQ（自动去重）</summary>
-    public void Mention(long qq) => _mentionedQqs.Add(qq);
-
-    public void Success(string line)
+    public void Success(long qq, string line)
     {
-        _lines.Add($"✅ {line}");
+        _lines.Add($"✅ [CQ:at,qq={qq}] {line}");
         SuccessCount++;
     }
 
-    public void Skip(string line)
+    public void Skip(long qq, string line)
     {
-        _lines.Add($"⚠️ {line}");
+        _lines.Add($"⚠️ [CQ:at,qq={qq}] {line}");
         SkipCount++;
     }
 
-    public void Fail(string line)
+    public void Fail(long qq, string line)
     {
-        _lines.Add($"❌ {line}");
+        _lines.Add($"❌ [CQ:at,qq={qq}] {line}");
         FailCount++;
     }
 
@@ -50,12 +46,7 @@ public sealed class GroupReport
     public string BuildMessage()
     {
         var sb = new StringBuilder();
-        sb.Append("🔄 开盘订单结算中…");
-        foreach (var qq in _mentionedQqs)
-        {
-            sb.Append(" [CQ:at,qq=").Append(qq).Append(']');
-        }
-        sb.AppendLine();
+        sb.AppendLine("🔄 开盘订单结算中…");
         sb.AppendLine();
 
         foreach (var line in _lines)

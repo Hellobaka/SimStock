@@ -117,8 +117,8 @@ public class MatchingEngine : IDisposable
                     }
 
                     var executionPrice = order.OrderType == 1 ? (decimal)quote.Ask1 : (decimal)quote.Bid1;
-                    await TradingService.ExecuteOrderAsync(order, executionPrice);
-                    Entry.Api.Logger.Info("撮合引擎", $"启动结算：订单 {order.Id} {order.StockCode} 已成交");
+                    var started = await TradingService.ExecuteOrderAsync(order, executionPrice);
+                    Entry.Api.Logger.Info("撮合引擎", $"启动结算：订单 {order.Id} {order.StockCode} {(started ? "已成交" : "未成交")}");
                 }
             }
             else
@@ -306,7 +306,12 @@ public class MatchingEngine : IDisposable
                     if (shouldExecute)
                     {
                         var execPrice = order.OrderType == 1 ? (decimal)quote.Ask1 : (decimal)quote.Bid1;
-                        await TradingService.ExecuteOrderAsync(order, execPrice);
+                        var executed = await TradingService.ExecuteOrderAsync(order, execPrice);
+                        if (!executed)
+                        {
+                            // 未成交（撒单/余额不足/订单状态变更），ExecuteOrderAsync 内部已处理通知，跳过成交通知
+                            continue;
+                        }
 
                         // 发送成交通知：群聊来源发群，私聊来源发私聊
                         try
