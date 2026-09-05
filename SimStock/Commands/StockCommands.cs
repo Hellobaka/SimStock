@@ -165,10 +165,15 @@ public class StockCommands : CommandHandlerBase
                 var cost = pos.AvgCost * pos.Quantity;
                 var mv = posMarketValues[pos.Id];
                 var pct = totalMarketValue > 0 ? mv / totalMarketValue * 100 : 0;
-                var currentPrice = quotes != null && quotes.TryGetValue(pos.StockCode, out var q) && q.Price > 0
-                    ? (decimal)q.Price : 0;
-                var lastClose = quotes != null && quotes.TryGetValue(pos.StockCode, out var q2) && q2.LastClose > 0
-                    ? (decimal)q2.LastClose : 0;
+                TdxProtocol.Models.QuoteResult? quote = null;
+                if (quotes != null && quotes.TryGetValue(pos.StockCode, out var fetchedQuote) && fetchedQuote.Price > 0)
+                {
+                    quote = fetchedQuote;
+                }
+
+                var hasQuote = quote is not null;
+                var currentPrice = quote is not null ? (decimal)quote.Price : pos.AvgCost;
+                var lastClose = quote is not null && quote.LastClose > 0 ? (decimal)quote.LastClose : 0;
 
                 // 持仓盈亏（相对均价）
                 var gainPct = pos.AvgCost > 0 ? (currentPrice - pos.AvgCost) / pos.AvgCost * 100 : 0;
@@ -183,8 +188,16 @@ public class StockCommands : CommandHandlerBase
                 sb.AppendLine($"📋 {StockCodeParser.ToDisplayStock(stockName, pos.StockCode)}");
                 sb.AppendLine($"   数量: {pos.Quantity} 股");
                 sb.AppendLine($"   均价: {pos.AvgCost:F2}");
-                sb.AppendLine($"   现价: {currentPrice:F2}  {dayEmoji} {daySign}{dayChangePct:F2}%");
-                sb.AppendLine($"   持仓盈亏: {gainEmoji} {gainSign}{gainPct:F2}%");
+                if (hasQuote)
+                {
+                    sb.AppendLine($"   现价: {currentPrice:F2}  {dayEmoji} {daySign}{dayChangePct:F2}%");
+                    sb.AppendLine($"   持仓盈亏: {gainEmoji} {gainSign}{gainPct:F2}%");
+                }
+                else
+                {
+                    sb.AppendLine("   现价: ⚠️ 行情获取失败");
+                    sb.AppendLine("   持仓盈亏: ⚠️ 行情获取失败");
+                }
                 sb.AppendLine($"   成本: {cost:N2}");
                 sb.AppendLine($"   市值: {mv:N2}");
                 sb.AppendLine($"   (占持仓 {pct:F1}%)");
@@ -294,9 +307,15 @@ public class StockCommands : CommandHandlerBase
         var (order, err3, fee) = await TradingService.MarketBuyAsync(qq, normalized, qty, sourceGroupId);
         if (err3 != null) { await SendAsync(g, p, err3); return EventHandleResult.Block; }
 
-        var quote = await Entry.Quotes!.GetQuoteAsync(market, resolvedCode);
-        var price = quote != null ? (decimal)quote.Ask1 : 0;
         var stockName = await Entry.StockNames.GetNameAsync(normalized);
+        var quote = await Entry.Quotes!.GetQuoteAsync(market, resolvedCode);
+        if (quote is null)
+        {
+            await SendAsync(g, p, $" ✅ 市价买入成功！\n股票: {StockCodeParser.ToDisplayStock(stockName, normalized)}\n数量: {qty} 股\n⚠️ 行情获取失败，无法显示成交价和金额\n手续费: {fee:F2} 元");
+            return EventHandleResult.Block;
+        }
+
+        var price = (decimal)quote.Ask1;
         await SendAsync(g, p, $" ✅ 市价买入成功！\n股票: {StockCodeParser.ToDisplayStock(stockName, normalized)}\n数量: {qty} 股\n成交价: {price:F2} 元\n金额: {price * qty:N2} 元\n手续费: {fee:F2} 元");
         return EventHandleResult.Block;
     }
@@ -810,7 +829,13 @@ public class StockCommands : CommandHandlerBase
             if (err3 != null) { await SendAsync(g, p, err3); return EventHandleResult.Block; }
 
             var quote = await Entry.Quotes!.GetQuoteAsync(market, resolvedCode);
-            var price = quote != null ? (decimal)quote.Bid1 : 0;
+            if (quote is null)
+            {
+                await SendAsync(g, p, $" ✅ 清仓成功！\n股票: {StockCodeParser.ToDisplayStock(stockName, normalized)}\n数量: {sellQty} 股\n⚠️ 行情获取失败，无法显示成交价和金额\n手续费: {fee:F2} 元");
+                return EventHandleResult.Block;
+            }
+
+            var price = (decimal)quote.Bid1;
             await SendAsync(g, p, $" ✅ 清仓成功！\n股票: {StockCodeParser.ToDisplayStock(stockName, normalized)}\n数量: {sellQty} 股\n成交价: {price:F2} 元\n金额: {price * sellQty:N2} 元\n手续费: {fee:F2} 元");
         }
         else if (int.TryParse(qty, out var parsedQty) && parsedQty > 0)
@@ -820,7 +845,13 @@ public class StockCommands : CommandHandlerBase
             if (err3 != null) { await SendAsync(g, p, err3); return EventHandleResult.Block; }
 
             var quote = await Entry.Quotes!.GetQuoteAsync(market, resolvedCode);
-            var price = quote != null ? (decimal)quote.Bid1 : 0;
+            if (quote is null)
+            {
+                await SendAsync(g, p, $" ✅ 市价卖出成功！\n股票: {StockCodeParser.ToDisplayStock(stockName, normalized)}\n数量: {parsedQty} 股\n⚠️ 行情获取失败，无法显示成交价和金额\n手续费: {fee:F2} 元");
+                return EventHandleResult.Block;
+            }
+
+            var price = (decimal)quote.Bid1;
             await SendAsync(g, p, $" ✅ 市价卖出成功！\n股票: {StockCodeParser.ToDisplayStock(stockName, normalized)}\n数量: {parsedQty} 股\n成交价: {price:F2} 元\n金额: {price * parsedQty:N2} 元\n手续费: {fee:F2} 元");
         }
         else
@@ -867,7 +898,13 @@ public class StockCommands : CommandHandlerBase
         if (err3 != null) { await SendAsync(g, p, err3); return EventHandleResult.Block; }
 
         var quote = await Entry.Quotes!.GetQuoteAsync(market, resolvedCode);
-        var price = quote != null ? (decimal)quote.Bid1 : 0;
+        if (quote is null)
+        {
+            await SendAsync(g, p, $" ✅ 清仓成功！\n股票: {StockCodeParser.ToDisplayStock(stockName, normalized)}\n数量: {qty} 股\n⚠️ 行情获取失败，无法显示成交价和金额\n手续费: {fee:F2} 元");
+            return EventHandleResult.Block;
+        }
+
+        var price = (decimal)quote.Bid1;
         await SendAsync(g, p, $" ✅ 清仓成功！\n股票: {StockCodeParser.ToDisplayStock(stockName, normalized)}\n数量: {qty} 股\n成交价: {price:F2} 元\n金额: {price * qty:N2} 元\n手续费: {fee:F2} 元");
         return EventHandleResult.Block;
     }

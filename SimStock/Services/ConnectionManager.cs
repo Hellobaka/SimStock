@@ -77,6 +77,73 @@ public class ConnectionManager : IDisposable
     }
 
     /// <summary>
+    /// 行情请求失败后，丢弃失败连接并从其他候选服务器中重新选择、连接。
+    /// 若其他请求已经完成了切换，则直接复用新的连接。
+    /// </summary>
+    public async Task<TdxClient?> ReconnectAfterQuoteFailureAsync(TdxClient failedClient, CancellationToken ct = default)
+    {
+        await _lock.WaitAsync(ct);
+        try
+        {
+            // 并发请求中可能已有请求完成了服务器切换，无需再次测速或影响新连接。
+            if (!ReferenceEquals(_client, failedClient))
+            {
+                return _client?.IsConnected == true ? _client : null;
+            }
+
+            var failedIp = failedClient.ConnectedIp ?? _bestIp;
+            var failedPort = failedClient.ConnectedPort != 0 ? failedClient.ConnectedPort : _bestPort;
+
+            _client?.Dispose();
+            _client = null;
+            _bestIp = null;
+            _bestPort = 0;
+
+            var candidates = BestIpFinder.HqServers
+                .Where(server => !string.Equals(server.Ip, failedIp, StringComparison.OrdinalIgnoreCase)
+                              || server.Port != failedPort)
+                .ToArray();
+
+            if (candidates.Length == 0)
+            {
+                Entry.Api.Logger.Warn("连接管理", "行情请求失败后没有可供切换的服务器");
+                return null;
+            }
+
+            Entry.Api.Logger.Warn("连接管理", $"行情请求失败，忽略服务器 {failedIp}:{failedPort} 并重新选择服务器");
+            TdxClient.Logger = msg => Entry.Api.Logger.Debug("TDX", msg);
+            BestIpFinder.Log = msg => Entry.Api.Logger.Info("寻找最佳服务器", msg);
+
+            var results = await BestIpFinder.BestIpAsync(top: 1, savePath: _bestIpCachePath, servers: candidates);
+            if (results.Length == 0)
+            {
+                Entry.Api.Logger.Warn("连接管理", "重新选择服务器失败，未找到可用服务器");
+                return null;
+            }
+
+            _bestIp = results[0].Server.Ip;
+            _bestPort = results[0].Server.Port;
+            _lastBestIpCheck = DateTime.Now;
+
+            _client = new TdxClient();
+            _client.Connect(_bestIp, _bestPort);
+            Entry.Api.Logger.Info("连接管理", $"已切换 TDX 服务器至 {_bestIp}:{_bestPort}");
+            return _client;
+        }
+        catch (Exception ex)
+        {
+            Entry.Api.Logger.Warn("连接管理", $"行情失败后的服务器切换失败: {ex.Message}");
+            _client?.Dispose();
+            _client = null;
+            return null;
+        }
+        finally
+        {
+            _lock.Release();
+        }
+    }
+
+    /// <summary>
     /// 断开 TDX 连接。
     /// </summary>
     public void Disconnect()

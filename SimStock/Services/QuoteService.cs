@@ -109,29 +109,8 @@ public class QuoteService
     /// </summary>
     public async Task<QuoteResult?> GetQuoteAsync(byte market, string code)
     {
-        var client = await Entry.ConnMgr!.EnsureConnectedAsync();
-        if (client == null)
-        {
-            Entry.Api.Logger.Warn("行情服务", "无法连接行情源，GetQuoteAsync 返回 null");
-            return null;
-        }
-
-        try
-        {
-            var cmd = new GetSecurityQuotesCmd();
-            cmd.SetParams([(market, code)]);
-            var results = cmd.ParseResponse(client.SendPacket(cmd.BuildRequest()));
-            if (results.Length == 0)
-            {
-                Entry.Api.Logger.Warn("行情服务", $"服务器返回空结果 (market={market}, code={code})");
-            }
-            return results.FirstOrDefault();
-        }
-        catch (Exception ex)
-        {
-            Entry.Api.Logger.Warn("行情服务", $"获取单股行情失败: {ex.Message}");
-            return null;
-        }
+        var results = await FetchQuotesWithRecoveryAsync([(market, code)]);
+        return results?.FirstOrDefault();
     }
 
     /// <summary>
@@ -139,37 +118,67 @@ public class QuoteService
     /// </summary>
     public async Task<Dictionary<string, QuoteResult>?> GetQuotesBatchAsync(List<(byte market, string code)> stocks)
     {
-        var client = await Entry.ConnMgr!.EnsureConnectedAsync();
-        if (client == null)
+        var results = await FetchQuotesWithRecoveryAsync(stocks.ToArray());
+        if (results is null) return null;
+
+        var dict = new Dictionary<string, QuoteResult>();
+        foreach (var r in results)
         {
-            Entry.Api.Logger.Warn("行情服务", "无法连接行情源，GetQuotesBatchAsync 返回 null");
+            dict[StockCodeParser.NormalizeCode((byte)r.Market, r.Code)] = r;
+        }
+
+        return dict;
+    }
+
+    /// <summary>
+    /// 请求行情；首次请求异常或返回空结果时，排除当前服务器后重新选择服务器并重试一次。
+    /// </summary>
+    private static async Task<QuoteResult[]?> FetchQuotesWithRecoveryAsync((byte market, string code)[] stocks)
+    {
+        var connMgr = Entry.ConnMgr;
+        if (connMgr is null)
+        {
+            Entry.Api.Logger.Warn("行情服务", "行情服务未就绪");
             return null;
         }
 
-        try
+        var client = await connMgr.EnsureConnectedAsync();
+        if (client is null)
         {
-            var cmd = new GetSecurityQuotesCmd();
-            cmd.SetParams(stocks.Select(s => (s.market, s.code)).ToArray());
-            var results = cmd.ParseResponse(client.SendPacket(cmd.BuildRequest()));
-
-            if (results.Length == 0)
-            {
-                Entry.Api.Logger.Warn("行情服务", $"服务器返回空结果，请求了 {stocks.Count} 只股票");
-            }
-
-            var dict = new Dictionary<string, QuoteResult>();
-            foreach (var r in results)
-            {
-                dict[StockCodeParser.NormalizeCode((byte)r.Market, r.Code)] = r;
-            }
-
-            return dict;
-        }
-        catch (Exception ex)
-        {
-            Entry.Api.Logger.Warn("行情服务", $"批量获取行情失败: {ex.Message}");
+            Entry.Api.Logger.Warn("行情服务", "无法连接行情源");
             return null;
         }
+
+        for (var attempt = 0; attempt < 2; attempt++)
+        {
+            try
+            {
+                var cmd = new GetSecurityQuotesCmd();
+                cmd.SetParams(stocks);
+                var results = cmd.ParseResponse(client.SendPacket(cmd.BuildRequest()));
+                if (results.Length > 0)
+                {
+                    return results;
+                }
+
+                Entry.Api.Logger.Warn("行情服务", $"服务器返回空结果，请求了 {stocks.Length} 只股票");
+            }
+            catch (Exception ex)
+            {
+                Entry.Api.Logger.Warn("行情服务", $"获取行情失败: {ex.Message}");
+            }
+
+            if (attempt == 0)
+            {
+                client = await connMgr.ReconnectAfterQuoteFailureAsync(client);
+                if (client is null)
+                {
+                    return null;
+                }
+            }
+        }
+
+        return [];
     }
 
     /// <summary>
